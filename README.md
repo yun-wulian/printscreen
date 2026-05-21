@@ -11,7 +11,7 @@ A lightweight Windows 10/11 screenshot helper that keeps your `PrintScreen` habi
 - Lets you drag with left mouse to select a rectangle
 - Keeps the frozen overlay open after selection so the region can be moved or resized
 - Provides an on-overlay toolbar for move, arrow, pen, rectangle, ellipse, text, undo, color, cancel, and OK
-- Copies the final annotated crop to clipboard (`CF_DIB`) only after OK or Enter
+- Copies the final annotated crop to clipboard (`CF_DIB`) after OK, Enter, double-clicking outside the selected region, or double-clicking anywhere while using a non-drawing tool
 - `Esc`, right-click, or Cancel closes the frozen overlay without copying
 
 ## Build
@@ -21,16 +21,16 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
-On machines with Visual Studio 2026, use:
+On machines with Visual Studio 2026, keep the same `build` output directory and use:
 
 ```powershell
-cmake -S . -B build-vs18 -G "Visual Studio 18 2026" -A x64
-cmake --build build-vs18 --config Release
+cmake -S . -B build -G "Visual Studio 18 2026" -A x64
+cmake --build build --config Release
 ```
 
 Binary output:
 
-- `build\Release\PrintScreenRegionSnip.exe` or `build-vs18\Release\PrintScreenRegionSnip.exe`
+- `build\Release\PrintScreenRegionSnip.exe`
 
 ## Install for current user (startup + silent background)
 

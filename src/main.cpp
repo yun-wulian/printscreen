@@ -947,6 +947,26 @@ void CommitTextIfNeeded(OverlayState& state) {
     state.textBuffer.clear();
 }
 
+bool IsDrawingTool(AnnotationTool tool) {
+    return tool == AnnotationTool::Pen ||
+        tool == AnnotationTool::Rectangle ||
+        tool == AnnotationTool::Ellipse ||
+        tool == AnnotationTool::Arrow ||
+        tool == AnnotationTool::Text;
+}
+
+void AcceptOverlay(HWND hwnd, OverlayState& state) {
+    CommitTextIfNeeded(state);
+    state.action = OverlayAction::None;
+    state.resizeHandle = ResizeHandle::None;
+    state.accepted = true;
+    state.finished = true;
+    if (GetCapture() == hwnd) {
+        ReleaseCapture();
+    }
+    DestroyWindow(hwnd);
+}
+
 bool HandleToolbarClick(OverlayState& state, POINT p) {
     for (const auto& button : BuildToolbar(state)) {
         if (!PtInRectInclusive(button.rect, p)) {
@@ -999,6 +1019,17 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         if (state && state->frame) {
             PaintOverlay(hwnd, *state);
             return 0;
+        }
+        break;
+    case WM_LBUTTONDBLCLK:
+        if (state && state->frame && HasArea(state->selectedRect)) {
+            POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            const bool outsideSelection = !PtInRectInclusive(state->selectedRect, p);
+            const bool nonDrawingTool = !IsDrawingTool(state->activeTool);
+            if (outsideSelection || nonDrawingTool) {
+                AcceptOverlay(hwnd, *state);
+                return 0;
+            }
         }
         break;
     case WM_LBUTTONDOWN:
@@ -1168,10 +1199,7 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 return 0;
             }
             if (wParam == VK_RETURN && HasArea(state->selectedRect)) {
-                CommitTextIfNeeded(*state);
-                state->accepted = true;
-                state->finished = true;
-                DestroyWindow(hwnd);
+                AcceptOverlay(hwnd, *state);
                 return 0;
             }
         }
@@ -1209,7 +1237,7 @@ std::optional<OverlayState> ShowOverlayAndEdit(CapturedFrame& frame) {
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.lpszClassName = kClassName;
         wc.hCursor = LoadCursorW(nullptr, IDC_CROSS);
-        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
         if (!RegisterClassExW(&wc)) {
             return std::nullopt;
         }
