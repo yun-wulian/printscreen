@@ -1,0 +1,14 @@
+#include "resource.h"
+
+IDI_APP ICON "../assets/icons/app-icon.ico"
+
+IDB_ICON_MOVE RCDATA "../assets/icons/move.png"
+IDB_ICON_ARROW RCDATA "../assets/icons/arrow.png"
+IDB_ICON_PEN RCDATA "../assets/icons/pen.png"
+IDB_ICON_RECTANGLE RCDATA "../assets/icons/rectangle.png"
+IDB_ICON_ELLIPSE RCDATA "../assets/icons/ellipse.png"
+IDB_ICON_TEXT RCDATA "../assets/icons/text.png"
+IDB_ICON_UNDO RCDATA "../assets/icons/undo.png"
+IDB_ICON_COLOR RCDATA "../assets/icons/color.png"
+IDB_ICON_CANCEL RCDATA "../assets/icons/cancel.png"
+IDB_ICON_OK RCDATA "../assets/icons/ok.png"

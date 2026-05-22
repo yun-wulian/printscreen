@@ -1,11 +1,12 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(PrintScreenRegionSnip LANGUAGES CXX)
+project(PrintScreenRegionSnip LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(PrintScreenRegionSnip WIN32
     src/main.cpp
+    src/app.rc
 )
 
 target_compile_definitions(PrintScreenRegionSnip PRIVATE
@@ -20,4 +21,5 @@ target_link_libraries(PrintScreenRegionSnip PRIVATE
     dxgi
     user32
     gdi32
+    gdiplus
 )

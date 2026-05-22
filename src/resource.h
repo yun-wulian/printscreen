@@ -1,0 +1,14 @@
+#pragma once
+
+#define IDI_APP 101
+
+#define IDB_ICON_MOVE 201
+#define IDB_ICON_ARROW 202
+#define IDB_ICON_PEN 203
+#define IDB_ICON_RECTANGLE 204
+#define IDB_ICON_ELLIPSE 205
+#define IDB_ICON_TEXT 206
+#define IDB_ICON_UNDO 207
+#define IDB_ICON_COLOR 208
+#define IDB_ICON_CANCEL 209
+#define IDB_ICON_OK 210

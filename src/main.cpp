@@ -2,6 +2,7 @@
 #include <windowsx.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <gdiplus.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -9,9 +10,13 @@
 #include <cstring>
 #include <cstdint>
 #include <cwchar>
+#include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#include "resource.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -627,6 +632,120 @@ void DrawAnnotation(HDC hdc, const AnnotationCommand& command, POINT offset = PO
     DeleteObject(pen);
 }
 
+int PngResourceForButton(const ToolbarButton& button) {
+    if (button.id == 0) {
+        switch (button.tool) {
+        case AnnotationTool::Select:
+            return IDB_ICON_MOVE;
+        case AnnotationTool::Arrow:
+            return IDB_ICON_ARROW;
+        case AnnotationTool::Pen:
+            return IDB_ICON_PEN;
+        case AnnotationTool::Rectangle:
+            return IDB_ICON_RECTANGLE;
+        case AnnotationTool::Ellipse:
+            return IDB_ICON_ELLIPSE;
+        case AnnotationTool::Text:
+            return IDB_ICON_TEXT;
+        default:
+            return 0;
+        }
+    }
+
+    switch (button.id) {
+    case 100:
+        return IDB_ICON_UNDO;
+    case 101:
+        return IDB_ICON_COLOR;
+    case 102:
+        return IDB_ICON_CANCEL;
+    case 103:
+        return IDB_ICON_OK;
+    default:
+        return 0;
+    }
+}
+
+std::unique_ptr<Gdiplus::Bitmap> LoadPngBitmapResource(int resourceId) {
+    HMODULE module = GetModuleHandleW(nullptr);
+    HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
+    if (!resource) {
+        return nullptr;
+    }
+
+    HGLOBAL loaded = LoadResource(module, resource);
+    const DWORD size = SizeofResource(module, resource);
+    const void* data = LockResource(loaded);
+    if (!loaded || size == 0 || !data) {
+        return nullptr;
+    }
+
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (!memory) {
+        return nullptr;
+    }
+
+    void* target = GlobalLock(memory);
+    if (!target) {
+        GlobalFree(memory);
+        return nullptr;
+    }
+    std::memcpy(target, data, size);
+    GlobalUnlock(memory);
+
+    IStream* stream = nullptr;
+    if (FAILED(CreateStreamOnHGlobal(memory, TRUE, &stream))) {
+        GlobalFree(memory);
+        return nullptr;
+    }
+
+    std::unique_ptr<Gdiplus::Bitmap> source(Gdiplus::Bitmap::FromStream(stream, FALSE));
+    if (!source || source->GetLastStatus() != Gdiplus::Ok) {
+        stream->Release();
+        return nullptr;
+    }
+
+    Gdiplus::Rect bounds(0, 0, static_cast<INT>(source->GetWidth()), static_cast<INT>(source->GetHeight()));
+    Gdiplus::Bitmap* cloned = source->Clone(bounds, PixelFormat32bppPARGB);
+    stream->Release();
+    if (!cloned || cloned->GetLastStatus() != Gdiplus::Ok) {
+        delete cloned;
+        return nullptr;
+    }
+    return std::unique_ptr<Gdiplus::Bitmap>(cloned);
+}
+
+Gdiplus::Bitmap* CachedPngResource(int resourceId) {
+    static std::unordered_map<int, std::unique_ptr<Gdiplus::Bitmap>> cache;
+    auto found = cache.find(resourceId);
+    if (found != cache.end()) {
+        return found->second.get();
+    }
+
+    auto bitmap = LoadPngBitmapResource(resourceId);
+    Gdiplus::Bitmap* raw = bitmap.get();
+    cache.emplace(resourceId, std::move(bitmap));
+    return raw;
+}
+
+bool DrawPngResourceIcon(HDC hdc, int resourceId, const RECT& r) {
+    Gdiplus::Bitmap* bitmap = CachedPngResource(resourceId);
+    if (!bitmap) {
+        return false;
+    }
+
+    const int targetSize = std::min(RectWidth(r), RectHeight(r));
+    const int x = r.left + (RectWidth(r) - targetSize) / 2;
+    const int y = r.top + (RectHeight(r) - targetSize) / 2;
+
+    Gdiplus::Graphics graphics(hdc);
+    graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+    graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    return graphics.DrawImage(bitmap, x, y, targetSize, targetSize) == Gdiplus::Ok;
+}
+
 std::vector<ToolbarButton> BuildToolbar(const OverlayState& state) {
     std::vector<ToolbarButton> buttons;
     if (!HasArea(state.selectedRect)) {
@@ -634,10 +753,9 @@ std::vector<ToolbarButton> BuildToolbar(const OverlayState& state) {
     }
 
     constexpr int iconW = 38;
-    constexpr int textW = 48;
     constexpr int buttonH = 32;
     constexpr int gap = 4;
-    constexpr int totalW = iconW * 9 + textW + gap * 9;
+    constexpr int totalW = iconW * 10 + gap * 9;
     int x = state.selectedRect.left;
     int y = state.selectedRect.bottom + 8;
     if (x + totalW > state.frame->width) {
@@ -665,7 +783,7 @@ std::vector<ToolbarButton> BuildToolbar(const OverlayState& state) {
     addTool(AnnotationTool::Pen, L"Pen", iconW);
     addTool(AnnotationTool::Rectangle, L"Rect", iconW);
     addTool(AnnotationTool::Ellipse, L"Oval", iconW);
-    addTool(AnnotationTool::Text, L"Text", textW);
+    addTool(AnnotationTool::Text, L"Text", iconW);
     addCommand(100, L"Undo", iconW);
     addCommand(101, L"Color", iconW);
     addCommand(102, L"Cancel", iconW);
@@ -674,6 +792,13 @@ std::vector<ToolbarButton> BuildToolbar(const OverlayState& state) {
 }
 
 void DrawToolbarIcon(HDC hdc, const ToolbarButton& button, const OverlayState& state) {
+    (void)state;
+
+    const int pngResource = PngResourceForButton(button);
+    if (pngResource != 0 && DrawPngResourceIcon(hdc, pngResource, button.rect)) {
+        return;
+    }
+
     const RECT r = button.rect;
     const int cx = (r.left + r.right) / 2;
     const int cy = (r.top + r.bottom) / 2;
@@ -683,80 +808,12 @@ void DrawToolbarIcon(HDC hdc, const ToolbarButton& button, const OverlayState& s
     HGDIOBJ oldPen = SelectObject(hdc, iconPen);
     HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
 
-    if (button.id == 0) {
-        switch (button.tool) {
-        case AnnotationTool::Select: {
-            MoveToEx(hdc, cx - 9, cy, nullptr);
-            LineTo(hdc, cx + 9, cy);
-            MoveToEx(hdc, cx, cy - 9, nullptr);
-            LineTo(hdc, cx, cy + 9);
-            POINT heads[] = {{cx - 9, cy}, {cx - 5, cy - 4}, {cx - 5, cy + 4}, {cx - 9, cy}, {cx + 9, cy}, {cx + 5, cy - 4}, {cx + 5, cy + 4}, {cx + 9, cy}, {cx, cy - 9}, {cx - 4, cy - 5}, {cx + 4, cy - 5}, {cx, cy - 9}, {cx, cy + 9}, {cx - 4, cy + 5}, {cx + 4, cy + 5}, {cx, cy + 9}};
-            Polyline(hdc, heads, ARRAYSIZE(heads));
-            break;
-        }
-        case AnnotationTool::Arrow:
-            MoveToEx(hdc, cx - 9, cy + 7, nullptr);
-            LineTo(hdc, cx + 9, cy - 7);
-            MoveToEx(hdc, cx + 9, cy - 7, nullptr);
-            LineTo(hdc, cx + 4, cy - 6);
-            MoveToEx(hdc, cx + 9, cy - 7, nullptr);
-            LineTo(hdc, cx + 7, cy - 2);
-            break;
-        case AnnotationTool::Pen:
-            MoveToEx(hdc, cx - 8, cy + 7, nullptr);
-            LineTo(hdc, cx + 6, cy - 7);
-            MoveToEx(hdc, cx + 3, cy - 8, nullptr);
-            LineTo(hdc, cx + 8, cy - 3);
-            MoveToEx(hdc, cx - 10, cy + 9, nullptr);
-            LineTo(hdc, cx - 3, cy + 7);
-            break;
-        case AnnotationTool::Rectangle:
-            Rectangle(hdc, cx - 10, cy - 7, cx + 10, cy + 7);
-            break;
-        case AnnotationTool::Ellipse:
-            Ellipse(hdc, cx - 10, cy - 8, cx + 10, cy + 8);
-            break;
-        case AnnotationTool::Text: {
-            SelectObject(hdc, oldBrush);
-            SelectObject(hdc, oldPen);
-            DeleteObject(iconPen);
-            HFONT font = CreateFontW(15, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-            HGDIOBJ oldFont = SelectObject(hdc, font);
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, iconColor);
-            RECT textRect = r;
-            DrawTextW(hdc, L"Text", -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(hdc, oldFont);
-            DeleteObject(font);
-            return;
-        }
-        default:
-            break;
-        }
-    } else if (button.id == 100) {
+    if (button.id == 100) {
         Arc(hdc, cx - 10, cy - 9, cx + 10, cy + 9, cx - 8, cy - 5, cx + 8, cy - 5);
         MoveToEx(hdc, cx - 9, cy - 5, nullptr);
         LineTo(hdc, cx - 4, cy - 10);
         MoveToEx(hdc, cx - 9, cy - 5, nullptr);
         LineTo(hdc, cx - 3, cy - 2);
-    } else if (button.id == 101) {
-        HBRUSH colorBrush = CreateSolidBrush(state.activeColor);
-        HPEN outline = CreatePen(PS_SOLID, 1, RGB(245, 245, 245));
-        SelectObject(hdc, outline);
-        SelectObject(hdc, colorBrush);
-        RoundRect(hdc, cx - 10, cy - 10, cx + 10, cy + 10, 4, 4);
-        DeleteObject(outline);
-        DeleteObject(colorBrush);
-    } else if (button.id == 102) {
-        MoveToEx(hdc, cx - 7, cy - 7, nullptr);
-        LineTo(hdc, cx + 7, cy + 7);
-        MoveToEx(hdc, cx + 7, cy - 7, nullptr);
-        LineTo(hdc, cx - 7, cy + 7);
-    } else if (button.id == 103) {
-        MoveToEx(hdc, cx - 9, cy, nullptr);
-        LineTo(hdc, cx - 2, cy + 7);
-        LineTo(hdc, cx + 10, cy - 8);
     }
 
     SelectObject(hdc, oldBrush);
@@ -772,8 +829,13 @@ void DrawToolbar(HDC hdc, const OverlayState& state) {
 
     for (const auto& button : buttons) {
         const bool active = button.id == 0 && button.tool == state.activeTool;
-        HBRUSH brush = CreateSolidBrush(active ? RGB(42, 142, 255) : RGB(48, 48, 48));
-        HPEN pen = CreatePen(PS_SOLID, 1, RGB(75, 75, 75));
+        const bool colorButton = button.id == 101;
+        const COLORREF fillColor = colorButton ? state.activeColor : (active ? RGB(42, 142, 255) : RGB(48, 48, 48));
+        const int luminance = (GetRValue(fillColor) * 299 + GetGValue(fillColor) * 587 + GetBValue(fillColor) * 114) / 1000;
+        const COLORREF borderColor = colorButton && luminance > 190 ? RGB(112, 112, 112) : RGB(75, 75, 75);
+
+        HBRUSH brush = CreateSolidBrush(fillColor);
+        HPEN pen = CreatePen(PS_SOLID, 1, borderColor);
         HGDIOBJ oldBrush = SelectObject(hdc, brush);
         HGDIOBJ oldPen = SelectObject(hdc, pen);
         RoundRect(hdc, button.rect.left, button.rect.top, button.rect.right, button.rect.bottom, 6, 6);
@@ -1024,6 +1086,15 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     case WM_LBUTTONDBLCLK:
         if (state && state->frame && HasArea(state->selectedRect)) {
             POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            if (HandleToolbarClick(*state, p)) {
+                if (state->finished) {
+                    DestroyWindow(hwnd);
+                } else {
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
+
             const bool outsideSelection = !PtInRectInclusive(state->selectedRect, p);
             const bool nonDrawingTool = !IsDrawingTool(state->activeTool);
             if (outsideSelection || nonDrawingTool) {
@@ -1237,6 +1308,8 @@ std::optional<OverlayState> ShowOverlayAndEdit(CapturedFrame& frame) {
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.lpszClassName = kClassName;
         wc.hCursor = LoadCursorW(nullptr, IDC_CROSS);
+        wc.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP));
+        wc.hIconSm = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP));
         wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
         if (!RegisterClassExW(&wc)) {
             return std::nullopt;
@@ -1472,6 +1545,13 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    Gdiplus::GdiplusStartupInput gdiplusInput{};
+    ULONG_PTR gdiplusToken = 0;
+    if (Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusInput, nullptr) != Gdiplus::Ok) {
+        MessageBoxW(nullptr, L"Failed to initialize GDI+.", L"PrintScreenRegionSnip", MB_ICONERROR);
+        return 1;
+    }
+
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     g_mainThreadId = GetCurrentThreadId();
@@ -1481,6 +1561,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, nullptr, 0);
     if (!g_keyboardHook) {
         MessageBoxW(nullptr, L"Failed to install keyboard hook.", L"PrintScreenRegionSnip", MB_ICONERROR);
+        Gdiplus::GdiplusShutdown(gdiplusToken);
         return 1;
     }
 
@@ -1501,6 +1582,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     UnhookWindowsHookEx(g_keyboardHook);
     g_keyboardHook = nullptr;
+    Gdiplus::GdiplusShutdown(gdiplusToken);
 
     return 0;
 }
