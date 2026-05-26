@@ -6,7 +6,7 @@ A lightweight Windows 10/11 screenshot helper that keeps your `PrintScreen` habi
 
 - Installs a global low-level keyboard hook for `PrintScreen` (`VK_SNAPSHOT`)
 - Suppresses the default system handling for that key
-- Captures the monitor under the mouse cursor (DXGI Desktop Duplication first, GDI fallback)
+- Captures the full virtual desktop across all monitors, with DXGI repair for the active fullscreen output when needed
 - Shows a full-screen frozen overlay with darkened background
 - Lets you drag with left mouse to select a rectangle
 - Keeps the frozen overlay open after selection so the region can be moved or resized
@@ -51,14 +51,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1
 
 ## Behavior notes
 
-- Current version captures only the monitor containing the cursor.
-- If DXGI returns a black frame, the app automatically falls back to GDI capture.
-- Most borderless/fullscreen apps work.
+- Current version freezes the full virtual desktop, so regions can span multiple displays.
+- The app uses full-desktop GDI capture first, then repairs the active fullscreen output with DXGI when available.
+- Most borderless/fullscreen apps work; exclusive fullscreen capture depends on OS/driver duplication support.
 - Some protected or anti-cheat-restricted content can still fail to capture due to OS/driver security boundaries.
 
 ## Next improvements
 
-- Multi-monitor full virtual desktop freeze (single canvas across all displays)
 - Optional delayed capture
 - Optional PNG auto-save
 - Tray icon + settings UI

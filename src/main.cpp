@@ -23,6 +23,7 @@ using Microsoft::WRL::ComPtr;
 namespace {
 
 constexpr UINT WM_APP_TRIGGER_CAPTURE = WM_APP + 101;
+constexpr int HOTKEY_PRINTSCREEN = 1;
 
 struct CapturedFrame {
     int width = 0;
@@ -108,6 +109,7 @@ struct OverlayState {
 HHOOK g_keyboardHook = nullptr;
 DWORD g_mainThreadId = 0;
 bool g_captureInProgress = false;
+bool g_captureQueued = false;
 
 bool HasArea(const RECT& r) {
     return (r.right - r.left) > 1 && (r.bottom - r.top) > 1;
@@ -233,11 +235,45 @@ bool IsAllBlackFrame(const std::vector<std::uint8_t>& pixels) {
     return true;
 }
 
+RECT GetVirtualDesktopRect() {
+    const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    return RECT{left, top, left + width, top + height};
+}
+
 bool PointInDesktopRect(const RECT& r, const POINT& p) {
     return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
 }
 
-bool CaptureWithDxgi(const POINT& cursorPos, CapturedFrame& out) {
+void CompositeFrame(CapturedFrame& dst, const CapturedFrame& src) {
+    RECT overlap{
+        std::max(dst.desktopRect.left, src.desktopRect.left),
+        std::max(dst.desktopRect.top, src.desktopRect.top),
+        std::min(dst.desktopRect.right, src.desktopRect.right),
+        std::min(dst.desktopRect.bottom, src.desktopRect.bottom)
+    };
+
+    if (!HasArea(overlap)) {
+        return;
+    }
+
+    const int copyWidth = RectWidth(overlap);
+    for (int y = 0; y < RectHeight(overlap); ++y) {
+        const int dstX = overlap.left - dst.desktopRect.left;
+        const int dstY = overlap.top - dst.desktopRect.top + y;
+        const int srcX = overlap.left - src.desktopRect.left;
+        const int srcY = overlap.top - src.desktopRect.top + y;
+        const auto* srcRow = src.pixels.data() +
+            (static_cast<size_t>(srcY) * static_cast<size_t>(src.width) + static_cast<size_t>(srcX)) * 4;
+        auto* dstRow = dst.pixels.data() +
+            (static_cast<size_t>(dstY) * static_cast<size_t>(dst.width) + static_cast<size_t>(dstX)) * 4;
+        std::memcpy(dstRow, srcRow, static_cast<size_t>(copyWidth) * 4);
+    }
+}
+
+bool CaptureCurrentOutputWithDxgi(const POINT& cursorPos, CapturedFrame& out) {
     ComPtr<IDXGIFactory1> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
         return false;
@@ -260,11 +296,7 @@ bool CaptureWithDxgi(const POINT& cursorPos, CapturedFrame& out) {
             }
 
             DXGI_OUTPUT_DESC desc{};
-            if (FAILED(output->GetDesc(&desc))) {
-                continue;
-            }
-
-            if (!PointInDesktopRect(desc.DesktopCoordinates, cursorPos)) {
+            if (FAILED(output->GetDesc(&desc)) || !PointInDesktopRect(desc.DesktopCoordinates, cursorPos)) {
                 continue;
             }
 
@@ -285,29 +317,7 @@ bool CaptureWithDxgi(const POINT& cursorPos, CapturedFrame& out) {
     }
 
     if (!selectedOutput1) {
-        ComPtr<IDXGIAdapter1> adapter;
-        if (factory->EnumAdapters1(0, &adapter) != S_OK) {
-            return false;
-        }
-
-        ComPtr<IDXGIOutput> output;
-        if (adapter->EnumOutputs(0, &output) != S_OK) {
-            return false;
-        }
-
-        DXGI_OUTPUT_DESC desc{};
-        if (FAILED(output->GetDesc(&desc))) {
-            return false;
-        }
-
-        ComPtr<IDXGIOutput1> output1;
-        if (FAILED(output.As(&output1))) {
-            return false;
-        }
-
-        selectedAdapter = adapter;
-        selectedOutput1 = output1;
-        selectedRect = desc.DesktopCoordinates;
+        return false;
     }
 
     UINT deviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -349,8 +359,8 @@ bool CaptureWithDxgi(const POINT& cursorPos, CapturedFrame& out) {
     DXGI_OUTDUPL_FRAME_INFO frameInfo{};
 
     bool gotFrame = false;
-    for (int i = 0; i < 8; ++i) {
-        hr = duplication->AcquireNextFrame(80, &frameInfo, &desktopResource);
+    for (int i = 0; i < 12; ++i) {
+        hr = duplication->AcquireNextFrame(60, &frameInfo, &desktopResource);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
             continue;
         }
@@ -409,21 +419,21 @@ bool CaptureWithDxgi(const POINT& cursorPos, CapturedFrame& out) {
     context->Unmap(stagingTexture.Get(), 0);
     duplication->ReleaseFrame();
 
+    if (IsAllBlackFrame(out.pixels)) {
+        return false;
+    }
+
     BuildDarkened(out.pixels, out.darkPixels);
     return true;
 }
 
-bool CaptureWithGdiFallback(const POINT& cursorPos, CapturedFrame& out) {
-    HMONITOR monitor = MonitorFromPoint(cursorPos, MONITOR_DEFAULTTOPRIMARY);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoW(monitor, &mi)) {
+bool CaptureWithGdiVirtualDesktop(CapturedFrame& out) {
+    const RECT r = GetVirtualDesktopRect();
+    const int width = RectWidth(r);
+    const int height = RectHeight(r);
+    if (width <= 0 || height <= 0) {
         return false;
     }
-
-    const RECT r = mi.rcMonitor;
-    const int width = r.right - r.left;
-    const int height = r.bottom - r.top;
 
     HDC screenDc = GetDC(nullptr);
     if (!screenDc) {
@@ -449,7 +459,7 @@ bool CaptureWithGdiFallback(const POINT& cursorPos, CapturedFrame& out) {
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = width;
-    bmi.bmiHeader.biHeight = -height;  // top-down
+    bmi.bmiHeader.biHeight = -height;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -472,6 +482,31 @@ bool CaptureWithGdiFallback(const POINT& cursorPos, CapturedFrame& out) {
 
     BuildDarkened(out.pixels, out.darkPixels);
     return true;
+}
+
+bool CaptureDesktopFrame(const POINT& cursorPos, CapturedFrame& out) {
+    const bool gdiCaptured = CaptureWithGdiVirtualDesktop(out);
+
+    CapturedFrame dxgiFrame;
+    if (CaptureCurrentOutputWithDxgi(cursorPos, dxgiFrame)) {
+        if (!gdiCaptured) {
+            const RECT virtualRect = GetVirtualDesktopRect();
+            out.width = RectWidth(virtualRect);
+            out.height = RectHeight(virtualRect);
+            out.desktopRect = virtualRect;
+            out.pixels.assign(static_cast<size_t>(out.width) * static_cast<size_t>(out.height) * 4, 0);
+        }
+
+        CompositeFrame(out, dxgiFrame);
+        BuildDarkened(out.pixels, out.darkPixels);
+        return !IsAllBlackFrame(out.pixels);
+    }
+
+    if (gdiCaptured) {
+        return true;
+    }
+
+    return false;
 }
 
 void DrawFrameFull(HDC hdc, const std::vector<std::uint8_t>& pixels, int frameWidth, int frameHeight) {
@@ -1494,19 +1529,21 @@ bool CopyToClipboardDib(const CroppedImage& image) {
     return true;
 }
 
+void RequestCapture() {
+    if (g_captureInProgress || g_captureQueued) {
+        return;
+    }
+
+    g_captureQueued = true;
+    PostThreadMessageW(g_mainThreadId, WM_APP_TRIGGER_CAPTURE, 0, 0);
+}
+
 void HandleCaptureRequest() {
     POINT cursorPos{};
     GetCursorPos(&cursorPos);
 
     CapturedFrame frame;
-    bool captured = CaptureWithDxgi(cursorPos, frame);
-    if (captured && IsAllBlackFrame(frame.pixels)) {
-        captured = false;
-    }
-
-    if (!captured) {
-        captured = CaptureWithGdiFallback(cursorPos, frame);
-    }
+    const bool captured = CaptureDesktopFrame(cursorPos, frame);
 
     if (!captured) {
         MessageBeep(MB_ICONHAND);
@@ -1532,8 +1569,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         const auto* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
         if (kb->vkCode == VK_SNAPSHOT) {
-            if ((wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) && !g_captureInProgress) {
-                PostThreadMessageW(g_mainThreadId, WM_APP_TRIGGER_CAPTURE, 0, 0);
+            if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+                RequestCapture();
             }
             return 1;  // always swallow PrintScreen to avoid system snipper popup/fullscreen path
         }
@@ -1565,10 +1602,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         return 1;
     }
 
+    RegisterHotKey(nullptr, HOTKEY_PRINTSCREEN, MOD_NOREPEAT, VK_SNAPSHOT);
+
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_PRINTSCREEN) {
+            RequestCapture();
+            continue;
+        }
+
         if (msg.message == WM_APP_TRIGGER_CAPTURE) {
             if (!g_captureInProgress) {
+                g_captureQueued = false;
                 g_captureInProgress = true;
                 HandleCaptureRequest();
                 g_captureInProgress = false;
@@ -1580,6 +1625,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&msg);
     }
 
+    UnregisterHotKey(nullptr, HOTKEY_PRINTSCREEN);
     UnhookWindowsHookEx(g_keyboardHook);
     g_keyboardHook = nullptr;
     Gdiplus::GdiplusShutdown(gdiplusToken);
