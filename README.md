@@ -11,7 +11,7 @@ A lightweight Windows 10/11 screenshot helper that keeps your `PrintScreen` habi
 - Lets you drag with left mouse to select a rectangle
 - Keeps the frozen overlay open after selection so the region can be moved or resized
 - Provides an on-overlay toolbar for move, arrow, pen, rectangle, ellipse, text, undo, color, cancel, and OK
-- Copies the final annotated crop to clipboard (`CF_DIB`) after OK, Enter, double-clicking outside the selected region, or double-clicking anywhere while using a non-drawing tool
+- Copies the final annotated crop as `CF_DIB`, `PNG`, and a `CF_HDROP` reference to a cached PNG file after OK, Enter, double-clicking outside the selected region, or double-clicking anywhere while using a non-drawing tool
 - `Esc`, right-click, or Cancel closes the frozen overlay without copying
 
 ## Build

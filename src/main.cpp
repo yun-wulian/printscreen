@@ -3,6 +3,8 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <gdiplus.h>
+#include <shlobj_core.h>
+
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -1472,58 +1474,269 @@ void BakeAnnotations(CroppedImage& image, const std::vector<AnnotationCommand>& 
     ReleaseDC(nullptr, screenDc);
 }
 
-bool CopyToClipboardDib(const CroppedImage& image) {
-    if (image.width <= 0 || image.height <= 0 || image.pixels.empty()) {
-        return false;
-    }
-
+HGLOBAL CreateClipboardDib(const CroppedImage& image) {
     const size_t headerSize = sizeof(BITMAPINFOHEADER);
     const size_t imageSize = static_cast<size_t>(image.width) * static_cast<size_t>(image.height) * 4;
 
-    HGLOBAL hMem = GlobalAlloc(GHND, headerSize + imageSize);
-    if (!hMem) {
-        return false;
+    HGLOBAL memory = GlobalAlloc(GHND, headerSize + imageSize);
+    if (!memory) {
+        return nullptr;
     }
 
-    auto* mem = static_cast<std::uint8_t*>(GlobalLock(hMem));
-    if (!mem) {
-        GlobalFree(hMem);
-        return false;
+    auto* bytes = static_cast<std::uint8_t*>(GlobalLock(memory));
+    if (!bytes) {
+        GlobalFree(memory);
+        return nullptr;
     }
 
-    auto* bih = reinterpret_cast<BITMAPINFOHEADER*>(mem);
-    bih->biSize = sizeof(BITMAPINFOHEADER);
-    bih->biWidth = image.width;
-    bih->biHeight = image.height;  // bottom-up storage
-    bih->biPlanes = 1;
-    bih->biBitCount = 32;
-    bih->biCompression = BI_RGB;
-    bih->biSizeImage = static_cast<DWORD>(imageSize);
-    bih->biXPelsPerMeter = 0;
-    bih->biYPelsPerMeter = 0;
-    bih->biClrUsed = 0;
-    bih->biClrImportant = 0;
+    auto* header = reinterpret_cast<BITMAPINFOHEADER*>(bytes);
+    header->biSize = sizeof(BITMAPINFOHEADER);
+    header->biWidth = image.width;
+    header->biHeight = image.height;  // bottom-up storage
+    header->biPlanes = 1;
+    header->biBitCount = 32;
+    header->biCompression = BI_RGB;
+    header->biSizeImage = static_cast<DWORD>(imageSize);
+    header->biXPelsPerMeter = 0;
+    header->biYPelsPerMeter = 0;
+    header->biClrUsed = 0;
+    header->biClrImportant = 0;
 
-    auto* dstPixels = mem + headerSize;
+    auto* dstPixels = bytes + headerSize;
     for (int y = 0; y < image.height; ++y) {
         const auto* srcRow = image.pixels.data() + static_cast<size_t>(image.height - 1 - y) * static_cast<size_t>(image.width) * 4;
         auto* dstRow = dstPixels + static_cast<size_t>(y) * static_cast<size_t>(image.width) * 4;
         std::memcpy(dstRow, srcRow, static_cast<size_t>(image.width) * 4);
     }
 
-    GlobalUnlock(hMem);
+    GlobalUnlock(memory);
+    return memory;
+}
+
+bool FindPngEncoder(CLSID& encoderClsid) {
+    UINT encoderCount = 0;
+    UINT encoderBytes = 0;
+    if (Gdiplus::GetImageEncodersSize(&encoderCount, &encoderBytes) != Gdiplus::Ok ||
+        encoderCount == 0 || encoderBytes == 0) {
+        return false;
+    }
+
+    std::vector<std::uint8_t> buffer(encoderBytes);
+    auto* encoders = reinterpret_cast<Gdiplus::ImageCodecInfo*>(buffer.data());
+    if (Gdiplus::GetImageEncoders(encoderCount, encoderBytes, encoders) != Gdiplus::Ok) {
+        return false;
+    }
+
+    for (UINT i = 0; i < encoderCount; ++i) {
+        if (encoders[i].MimeType && std::wcscmp(encoders[i].MimeType, L"image/png") == 0) {
+            encoderClsid = encoders[i].Clsid;
+            return true;
+        }
+    }
+    return false;
+}
+
+HGLOBAL CreateClipboardPng(const CroppedImage& image) {
+    CLSID pngEncoder{};
+    if (!FindPngEncoder(pngEncoder)) {
+        return nullptr;
+    }
+
+    IStream* stream = nullptr;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream))) {
+        return nullptr;
+    }
+
+    Gdiplus::Bitmap bitmap(
+        image.width,
+        image.height,
+        image.width * 4,
+        PixelFormat32bppRGB,
+        const_cast<BYTE*>(image.pixels.data()));
+    if (bitmap.GetLastStatus() != Gdiplus::Ok || bitmap.Save(stream, &pngEncoder, nullptr) != Gdiplus::Ok) {
+        stream->Release();
+        return nullptr;
+    }
+
+    STATSTG streamStat{};
+    HGLOBAL streamMemory = nullptr;
+    if (FAILED(stream->Stat(&streamStat, STATFLAG_NONAME)) ||
+        streamStat.cbSize.HighPart != 0 || streamStat.cbSize.LowPart == 0 ||
+        FAILED(GetHGlobalFromStream(stream, &streamMemory))) {
+        stream->Release();
+        return nullptr;
+    }
+
+    HGLOBAL clipboardMemory = GlobalAlloc(GMEM_MOVEABLE, streamStat.cbSize.LowPart);
+    void* source = streamMemory ? GlobalLock(streamMemory) : nullptr;
+    void* destination = clipboardMemory ? GlobalLock(clipboardMemory) : nullptr;
+    if (!source || !destination) {
+        if (source) {
+            GlobalUnlock(streamMemory);
+        }
+        if (destination) {
+            GlobalUnlock(clipboardMemory);
+        }
+        if (clipboardMemory) {
+            GlobalFree(clipboardMemory);
+        }
+        stream->Release();
+        return nullptr;
+    }
+
+    std::memcpy(destination, source, streamStat.cbSize.LowPart);
+    GlobalUnlock(clipboardMemory);
+    GlobalUnlock(streamMemory);
+    stream->Release();
+    return clipboardMemory;
+}
+
+std::optional<std::wstring> CacheClipboardPng(HGLOBAL pngMemory) {
+    const DWORD localAppDataChars = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
+    if (localAppDataChars == 0) {
+        return std::nullopt;
+    }
+
+    std::wstring localAppData(localAppDataChars, L'\0');
+    const DWORD copiedChars = GetEnvironmentVariableW(
+        L"LOCALAPPDATA",
+        localAppData.data(),
+        localAppDataChars);
+    if (copiedChars == 0 || copiedChars >= localAppDataChars) {
+        return std::nullopt;
+    }
+    localAppData.resize(copiedChars);
+
+    const std::wstring cacheDirectory = localAppData + L"\\PrintScreenRegionSnip";
+    if (!CreateDirectoryW(cacheDirectory.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        return std::nullopt;
+    }
+
+    const std::wstring finalPath = cacheDirectory + L"\\clipboard-image.png";
+    const std::wstring temporaryPath = cacheDirectory + L"\\clipboard-image.tmp";
+    const SIZE_T pngSize = GlobalSize(pngMemory);
+    const void* pngBytes = GlobalLock(pngMemory);
+    if (!pngBytes || pngSize == 0 || pngSize > MAXDWORD) {
+        if (pngBytes) {
+            GlobalUnlock(pngMemory);
+        }
+        return std::nullopt;
+    }
+
+    HANDLE file = CreateFileW(
+        temporaryPath.c_str(),
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        GlobalUnlock(pngMemory);
+        return std::nullopt;
+    }
+
+    DWORD writtenBytes = 0;
+    const bool writeSucceeded =
+        WriteFile(file, pngBytes, static_cast<DWORD>(pngSize), &writtenBytes, nullptr) &&
+        writtenBytes == pngSize &&
+        FlushFileBuffers(file);
+    CloseHandle(file);
+    GlobalUnlock(pngMemory);
+
+    if (!writeSucceeded) {
+        DeleteFileW(temporaryPath.c_str());
+        return std::nullopt;
+    }
+    if (!MoveFileExW(
+            temporaryPath.c_str(),
+            finalPath.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temporaryPath.c_str());
+        return std::nullopt;
+    }
+
+    return finalPath;
+}
+
+HGLOBAL CreateClipboardFileDrop(const std::wstring& imagePath) {
+    const size_t pathBytes = (imagePath.size() + 2) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GHND, sizeof(DROPFILES) + pathBytes);
+    if (!memory) {
+        return nullptr;
+    }
+
+    auto* bytes = static_cast<std::uint8_t*>(GlobalLock(memory));
+    if (!bytes) {
+        GlobalFree(memory);
+        return nullptr;
+    }
+
+    auto* dropFiles = reinterpret_cast<DROPFILES*>(bytes);
+    dropFiles->pFiles = sizeof(DROPFILES);
+    dropFiles->fWide = TRUE;
+
+    auto* fileList = reinterpret_cast<wchar_t*>(bytes + sizeof(DROPFILES));
+    std::memcpy(fileList, imagePath.c_str(), (imagePath.size() + 1) * sizeof(wchar_t));
+    fileList[imagePath.size() + 1] = L'\0';
+
+    GlobalUnlock(memory);
+    return memory;
+}
+
+bool CopyToClipboard(const CroppedImage& image) {
+    if (image.width <= 0 || image.height <= 0 || image.pixels.empty()) {
+        return false;
+    }
+
+    HGLOBAL dibMemory = CreateClipboardDib(image);
+    HGLOBAL pngMemory = CreateClipboardPng(image);
+    const auto cachedPngPath = pngMemory ? CacheClipboardPng(pngMemory) : std::nullopt;
+    HGLOBAL fileDropMemory = cachedPngPath ? CreateClipboardFileDrop(*cachedPngPath) : nullptr;
+    const UINT pngFormat = RegisterClipboardFormatW(L"PNG");
+    if (!dibMemory || !pngMemory || !fileDropMemory || pngFormat == 0) {
+        if (dibMemory) {
+            GlobalFree(dibMemory);
+        }
+        if (pngMemory) {
+            GlobalFree(pngMemory);
+        }
+        if (fileDropMemory) {
+            GlobalFree(fileDropMemory);
+        }
+        return false;
+    }
 
     if (!OpenClipboard(nullptr)) {
-        GlobalFree(hMem);
+        GlobalFree(dibMemory);
+        GlobalFree(pngMemory);
+        GlobalFree(fileDropMemory);
         return false;
     }
 
-    EmptyClipboard();
-    if (!SetClipboardData(CF_DIB, hMem)) {
+    if (!EmptyClipboard() || !SetClipboardData(CF_DIB, dibMemory)) {
         CloseClipboard();
-        GlobalFree(hMem);
+        GlobalFree(dibMemory);
+        GlobalFree(pngMemory);
+        GlobalFree(fileDropMemory);
         return false;
     }
+    dibMemory = nullptr;  // clipboard owns it after SetClipboardData succeeds
+
+    if (!SetClipboardData(pngFormat, pngMemory)) {
+        CloseClipboard();
+        GlobalFree(pngMemory);
+        GlobalFree(fileDropMemory);
+        return false;
+    }
+    pngMemory = nullptr;  // clipboard owns it after SetClipboardData succeeds
+
+    if (!SetClipboardData(CF_HDROP, fileDropMemory)) {
+        CloseClipboard();
+        GlobalFree(fileDropMemory);
+        return false;
+    }
+    fileDropMemory = nullptr;  // clipboard owns it after SetClipboardData succeeds
 
     CloseClipboard();
     return true;
@@ -1558,7 +1771,7 @@ void HandleCaptureRequest() {
     CroppedImage crop = CropFrame(frame, editResult->selectedRect);
     POINT cropOrigin{editResult->selectedRect.left, editResult->selectedRect.top};
     BakeAnnotations(crop, editResult->annotations, cropOrigin);
-    if (CopyToClipboardDib(crop)) {
+    if (CopyToClipboard(crop)) {
         MessageBeep(MB_OK);
     } else {
         MessageBeep(MB_ICONHAND);
@@ -1632,5 +1845,3 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     return 0;
 }
-
-
