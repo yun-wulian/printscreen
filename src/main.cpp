@@ -8,15 +8,22 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cstdint>
 #include <cwchar>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#if defined(_M_X64) || defined(__SSE2__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <emmintrin.h>
+#define PRINTSCREEN_HAS_SSE2
+#endif
 
 #include "resource.h"
 
@@ -27,12 +34,62 @@ namespace {
 constexpr UINT WM_APP_TRIGGER_CAPTURE = WM_APP + 101;
 constexpr int HOTKEY_PRINTSCREEN = 1;
 
+BITMAPINFO TopDownBitmapInfo(int width, int height) {
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    return bmi;
+}
+
+struct DibBitmap {
+    HBITMAP handle = nullptr;
+    std::span<std::uint8_t> pixels;
+
+    DibBitmap() = default;
+    DibBitmap(const DibBitmap&) = delete;
+    DibBitmap& operator=(const DibBitmap&) = delete;
+
+    ~DibBitmap() {
+        if (handle) {
+            DeleteObject(handle);
+        }
+    }
+
+    bool Create(int width, int height, HDC dc = nullptr) {
+        if (width <= 0 || height <= 0) {
+            return false;
+        }
+        const BITMAPINFO bmi = TopDownBitmapInfo(width, height);
+        void* bits = nullptr;
+        handle = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!handle) {
+            return false;
+        }
+        pixels = {static_cast<std::uint8_t*>(bits), static_cast<size_t>(width) * height * 4};
+        return true;
+    }
+};
+
 struct CapturedFrame {
     int width = 0;
     int height = 0;
     RECT desktopRect{};
-    std::vector<std::uint8_t> pixels;      // BGRA, top-down
-    std::vector<std::uint8_t> darkPixels;  // BGRA, top-down
+    DibBitmap image;
+    DibBitmap darkened;
+
+    bool Create(int imageWidth, int imageHeight, const RECT& rect, HDC dc = nullptr) {
+        if (!image.Create(imageWidth, imageHeight, dc)) {
+            return false;
+        }
+        width = imageWidth;
+        height = imageHeight;
+        desktopRect = rect;
+        return true;
+    }
 };
 
 struct CroppedImage {
@@ -48,6 +105,7 @@ enum class AnnotationTool {
     Ellipse,
     Arrow,
     Text,
+    Mosaic,
 };
 
 enum class OverlayAction {
@@ -76,6 +134,13 @@ struct AnnotationCommand {
     int strokeWidth = 3;
     std::vector<POINT> points;
     std::wstring text;
+};
+
+struct AnnotationSurface {
+    HDC dc;
+    std::uint8_t* pixels;
+    RECT bounds;  // bitmap extent in frame coordinates
+    RECT clip;    // selection inside bounds
 };
 
 struct ToolbarButton {
@@ -108,10 +173,8 @@ struct OverlayState {
     std::wstring textBuffer;
 };
 
-HHOOK g_keyboardHook = nullptr;
 DWORD g_mainThreadId = 0;
-bool g_captureInProgress = false;
-bool g_captureQueued = false;
+std::atomic_bool g_capturePending{false};
 
 bool HasArea(const RECT& r) {
     return (r.right - r.left) > 1 && (r.bottom - r.top) > 1;
@@ -213,18 +276,30 @@ RECT ResizeRectFromHandle(RECT startRect, ResizeHandle handle, POINT p, int widt
     return r;
 }
 
-void BuildDarkened(const std::vector<std::uint8_t>& src, std::vector<std::uint8_t>& dst) {
-    dst = src;
+void BuildDarkened(std::span<const std::uint8_t> src, std::span<std::uint8_t> dst) {
+    size_t i = 0;
+#ifdef PRINTSCREEN_HAS_SSE2
+    // 24904 / 65536 preserves truncation at 38% for all 8-bit inputs.
+    const auto multiplier = _mm_set1_epi16(24904);
+    const auto zero = _mm_setzero_si128();
+    const auto opaque = _mm_set1_epi32(static_cast<int>(0xff000000u));
+    for (; i + 16 <= src.size(); i += 16) {
+        const auto bgra = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src.data() + i));
+        const auto low = _mm_mulhi_epu16(_mm_unpacklo_epi8(bgra, zero), multiplier);
+        const auto high = _mm_mulhi_epu16(_mm_unpackhi_epi8(bgra, zero), multiplier);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst.data() + i), _mm_or_si128(_mm_packus_epi16(low, high), opaque));
+    }
+#endif
     constexpr float factor = 0.38f;
-    for (size_t i = 0; i + 3 < dst.size(); i += 4) {
-        dst[i + 0] = static_cast<std::uint8_t>(dst[i + 0] * factor);
-        dst[i + 1] = static_cast<std::uint8_t>(dst[i + 1] * factor);
-        dst[i + 2] = static_cast<std::uint8_t>(dst[i + 2] * factor);
+    for (; i < src.size(); i += 4) {
+        dst[i + 0] = static_cast<std::uint8_t>(src[i + 0] * factor);
+        dst[i + 1] = static_cast<std::uint8_t>(src[i + 1] * factor);
+        dst[i + 2] = static_cast<std::uint8_t>(src[i + 2] * factor);
         dst[i + 3] = 0xFF;
     }
 }
 
-bool IsAllBlackFrame(const std::vector<std::uint8_t>& pixels) {
+bool IsAllBlackFrame(std::span<const std::uint8_t> pixels) {
     if (pixels.empty()) {
         return true;
     }
@@ -245,8 +320,28 @@ RECT GetVirtualDesktopRect() {
     return RECT{left, top, left + width, top + height};
 }
 
-bool PointInDesktopRect(const RECT& r, const POINT& p) {
-    return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
+HMONITOR FullscreenWindowMonitor(HWND hwnd) {
+    if (!hwnd || hwnd == GetDesktopWindow() || hwnd == GetShellWindow() || IsIconic(hwnd)) {
+        return nullptr;
+    }
+
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+    MONITORINFO info{sizeof(info)};
+    RECT client{};
+    if (!monitor || !GetMonitorInfoW(monitor, &info) || !GetClientRect(hwnd, &client)) {
+        return nullptr;
+    }
+
+    POINT topLeft{client.left, client.top};
+    POINT bottomRight{client.right, client.bottom};
+    if (!ClientToScreen(hwnd, &topLeft) || !ClientToScreen(hwnd, &bottomRight)) {
+        return nullptr;
+    }
+
+    const RECT& screen = info.rcMonitor;
+    const bool coversMonitor = topLeft.x <= screen.left && topLeft.y <= screen.top &&
+        bottomRight.x >= screen.right && bottomRight.y >= screen.bottom;
+    return coversMonitor ? monitor : nullptr;
 }
 
 void CompositeFrame(CapturedFrame& dst, const CapturedFrame& src) {
@@ -267,15 +362,15 @@ void CompositeFrame(CapturedFrame& dst, const CapturedFrame& src) {
         const int dstY = overlap.top - dst.desktopRect.top + y;
         const int srcX = overlap.left - src.desktopRect.left;
         const int srcY = overlap.top - src.desktopRect.top + y;
-        const auto* srcRow = src.pixels.data() +
+        const auto* srcRow = src.image.pixels.data() +
             (static_cast<size_t>(srcY) * static_cast<size_t>(src.width) + static_cast<size_t>(srcX)) * 4;
-        auto* dstRow = dst.pixels.data() +
+        auto* dstRow = dst.image.pixels.data() +
             (static_cast<size_t>(dstY) * static_cast<size_t>(dst.width) + static_cast<size_t>(dstX)) * 4;
         std::memcpy(dstRow, srcRow, static_cast<size_t>(copyWidth) * 4);
     }
 }
 
-bool CaptureCurrentOutputWithDxgi(const POINT& cursorPos, CapturedFrame& out) {
+bool CaptureOutputWithDxgi(HMONITOR monitor, CapturedFrame& out) {
     ComPtr<IDXGIFactory1> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
         return false;
@@ -298,7 +393,7 @@ bool CaptureCurrentOutputWithDxgi(const POINT& cursorPos, CapturedFrame& out) {
             }
 
             DXGI_OUTPUT_DESC desc{};
-            if (FAILED(output->GetDesc(&desc)) || !PointInDesktopRect(desc.DesktopCoordinates, cursorPos)) {
+            if (FAILED(output->GetDesc(&desc)) || desc.Monitor != monitor) {
                 continue;
             }
 
@@ -398,6 +493,10 @@ bool CaptureCurrentOutputWithDxgi(const POINT& cursorPos, CapturedFrame& out) {
         return false;
     }
 
+    if (!out.Create(static_cast<int>(texDesc.Width), static_cast<int>(texDesc.Height), selectedRect)) {
+        duplication->ReleaseFrame();
+        return false;
+    }
     context->CopyResource(stagingTexture.Get(), gpuTexture.Get());
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -407,30 +506,19 @@ bool CaptureCurrentOutputWithDxgi(const POINT& cursorPos, CapturedFrame& out) {
         return false;
     }
 
-    out.width = static_cast<int>(texDesc.Width);
-    out.height = static_cast<int>(texDesc.Height);
-    out.desktopRect = selectedRect;
-    out.pixels.resize(static_cast<size_t>(out.width) * static_cast<size_t>(out.height) * 4);
-
     for (int y = 0; y < out.height; ++y) {
         const auto* src = reinterpret_cast<const std::uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch;
-        auto* dst = out.pixels.data() + static_cast<size_t>(y) * static_cast<size_t>(out.width) * 4;
+        auto* dst = out.image.pixels.data() + static_cast<size_t>(y) * static_cast<size_t>(out.width) * 4;
         std::memcpy(dst, src, static_cast<size_t>(out.width) * 4);
     }
 
     context->Unmap(stagingTexture.Get(), 0);
     duplication->ReleaseFrame();
 
-    if (IsAllBlackFrame(out.pixels)) {
-        return false;
-    }
-
-    BuildDarkened(out.pixels, out.darkPixels);
-    return true;
+    return !IsAllBlackFrame(out.image.pixels);
 }
 
-bool CaptureWithGdiVirtualDesktop(CapturedFrame& out) {
-    const RECT r = GetVirtualDesktopRect();
+bool CaptureWithGdiVirtualDesktop(const RECT& r, CapturedFrame& out) {
     const int width = RectWidth(r);
     const int height = RectHeight(r);
     if (width <= 0 || height <= 0) {
@@ -448,77 +536,50 @@ bool CaptureWithGdiVirtualDesktop(CapturedFrame& out) {
         return false;
     }
 
-    HBITMAP bmp = CreateCompatibleBitmap(screenDc, width, height);
-    if (!bmp) {
-        DeleteDC(memDc);
-        ReleaseDC(nullptr, screenDc);
-        return false;
+    HGDIOBJ old = out.Create(width, height, r, screenDc) ? SelectObject(memDc, out.image.handle) : nullptr;
+    const bool captured = old &&
+        BitBlt(memDc, 0, 0, width, height, screenDc, r.left, r.top, SRCCOPY | CAPTUREBLT) && GdiFlush();
+
+    if (old) {
+        SelectObject(memDc, old);
     }
-
-    HGDIOBJ old = SelectObject(memDc, bmp);
-    const BOOL bltOk = BitBlt(memDc, 0, 0, width, height, screenDc, r.left, r.top, SRCCOPY | CAPTUREBLT);
-
-    BITMAPINFO bmi{};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = width;
-    bmi.bmiHeader.biHeight = -height;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    out.width = width;
-    out.height = height;
-    out.desktopRect = r;
-    out.pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
-
-    const int lines = GetDIBits(memDc, bmp, 0, static_cast<UINT>(height), out.pixels.data(), &bmi, DIB_RGB_COLORS);
-
-    SelectObject(memDc, old);
-    DeleteObject(bmp);
     DeleteDC(memDc);
     ReleaseDC(nullptr, screenDc);
 
-    if (!bltOk || lines != height || IsAllBlackFrame(out.pixels)) {
-        return false;
-    }
-
-    BuildDarkened(out.pixels, out.darkPixels);
-    return true;
+    return captured && !IsAllBlackFrame(out.image.pixels);
 }
 
 bool CaptureDesktopFrame(const POINT& cursorPos, CapturedFrame& out) {
-    const bool gdiCaptured = CaptureWithGdiVirtualDesktop(out);
+    const RECT virtualRect = GetVirtualDesktopRect();
+    HMONITOR dxgiMonitor = FullscreenWindowMonitor(GetForegroundWindow());
+    const bool gdiOk = CaptureWithGdiVirtualDesktop(virtualRect, out);
+    bool captured = gdiOk;
 
-    CapturedFrame dxgiFrame;
-    if (CaptureCurrentOutputWithDxgi(cursorPos, dxgiFrame)) {
-        if (!gdiCaptured) {
-            const RECT virtualRect = GetVirtualDesktopRect();
-            out.width = RectWidth(virtualRect);
-            out.height = RectHeight(virtualRect);
-            out.desktopRect = virtualRect;
-            out.pixels.assign(static_cast<size_t>(out.width) * static_cast<size_t>(out.height) * 4, 0);
+    if (!dxgiMonitor && !gdiOk) {
+        dxgiMonitor = MonitorFromPoint(cursorPos, MONITOR_DEFAULTTONEAREST);
+    }
+    if (dxgiMonitor) {
+        CapturedFrame dxgiFrame;
+        if (CaptureOutputWithDxgi(dxgiMonitor, dxgiFrame)) {
+            if (!gdiOk) {
+                if (out.image.pixels.empty() && !out.Create(RectWidth(virtualRect), RectHeight(virtualRect), virtualRect)) {
+                    return false;
+                }
+                std::fill(out.image.pixels.begin(), out.image.pixels.end(), 0);
+            }
+            CompositeFrame(out, dxgiFrame);
+            captured = !IsAllBlackFrame(out.image.pixels);
         }
-
-        CompositeFrame(out, dxgiFrame);
-        BuildDarkened(out.pixels, out.darkPixels);
-        return !IsAllBlackFrame(out.pixels);
     }
-
-    if (gdiCaptured) {
-        return true;
+    if (!captured || !out.darkened.Create(out.width, out.height)) {
+        return false;
     }
-
-    return false;
+    BuildDarkened(out.image.pixels, out.darkened.pixels);
+    return true;
 }
 
-void DrawFrameFull(HDC hdc, const std::vector<std::uint8_t>& pixels, int frameWidth, int frameHeight) {
-    BITMAPINFO bmi{};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = frameWidth;
-    bmi.bmiHeader.biHeight = -frameHeight;  // top-down
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
+void DrawFrameFull(HDC hdc, std::span<const std::uint8_t> pixels, int frameWidth, int frameHeight) {
+    const BITMAPINFO bmi = TopDownBitmapInfo(frameWidth, frameHeight);
 
     const int scanLinesCopied = SetDIBitsToDevice(
         hdc,
@@ -552,27 +613,78 @@ void DrawFrameFull(HDC hdc, const std::vector<std::uint8_t>& pixels, int frameWi
     }
 }
 
-void DrawFrameClipRect(HDC hdc, const std::vector<std::uint8_t>& pixels, int frameWidth, int frameHeight, const RECT& clipRect) {
+void DrawFrameClipRect(HDC hdc, std::span<const std::uint8_t> pixels, int frameWidth, int frameHeight, const RECT& clipRect) {
     const int saved = SaveDC(hdc);
     IntersectClipRect(hdc, clipRect.left, clipRect.top, clipRect.right, clipRect.bottom);
     DrawFrameFull(hdc, pixels, frameWidth, frameHeight);
     RestoreDC(hdc, saved);
 }
 
-void DrawAnnotation(HDC hdc, const AnnotationCommand& command, POINT offset = POINT{0, 0}) {
-    if (command.points.empty()) {
-        return;
+bool DrawMosaic(const AnnotationSurface& surface, const RECT& source) {
+    RECT visible{};
+    if (!IntersectRect(&visible, &source, &surface.clip)) {
+        return true;
+    }
+    // Finish pending GDI drawing before sampling the composited pixels.
+    if (!surface.pixels || !GdiFlush()) {
+        return false;
     }
 
+    constexpr LONG tileSize = 16;
+    const size_t stride = static_cast<size_t>(RectWidth(surface.bounds)) * 4;
+    auto pixelAt = [&](LONG x, LONG y) {
+        return surface.pixels + (y - surface.bounds.top) * stride + static_cast<size_t>(x - surface.bounds.left) * 4;
+    };
+    for (LONG top = visible.top; top < visible.bottom;) {
+        const LONG bottom = std::min(top + tileSize - (top - source.top) % tileSize, visible.bottom);
+        for (LONG left = visible.left; left < visible.right;) {
+            const LONG right = std::min(left + tileSize - (left - source.left) % tileSize, visible.right);
+            unsigned blue = 0;
+            unsigned green = 0;
+            unsigned red = 0;
+            for (LONG y = top; y < bottom; ++y) {
+                const auto* pixel = pixelAt(left, y);
+                for (LONG x = left; x < right; ++x, pixel += 4) {
+                    blue += pixel[0];
+                    green += pixel[1];
+                    red += pixel[2];
+                }
+            }
+            const auto count = static_cast<unsigned>((right - left) * (bottom - top));
+            const RGBQUAD average{static_cast<BYTE>(blue / count), static_cast<BYTE>(green / count),
+                static_cast<BYTE>(red / count), 255};
+            for (LONG y = top; y < bottom; ++y) {
+                auto* pixel = pixelAt(left, y);
+                for (LONG x = left; x < right; ++x, pixel += 4) {
+                    std::memcpy(pixel, &average, sizeof(average));
+                }
+            }
+            left = right;
+        }
+        top = bottom;
+    }
+    return true;
+}
+
+bool DrawAnnotation(const AnnotationSurface& surface, const AnnotationCommand& command) {
+    if (command.points.empty()) {
+        return true;
+    }
+    if (command.tool == AnnotationTool::Mosaic) {
+        const RECT source = NormalizeRect(command.points.front(), command.points.back());
+        return DrawMosaic(surface, source);
+    }
+
+    HDC hdc = surface.dc;
     HPEN pen = CreatePen(PS_SOLID, command.strokeWidth, command.color);
     HGDIOBJ oldPen = SelectObject(hdc, pen);
     HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, command.color);
 
-    auto tx = [offset](POINT p) {
-        p.x -= offset.x;
-        p.y -= offset.y;
+    auto tx = [&surface](POINT p) {
+        p.x -= surface.bounds.left;
+        p.y -= surface.bounds.top;
         return p;
     };
 
@@ -667,6 +779,7 @@ void DrawAnnotation(HDC hdc, const AnnotationCommand& command, POINT offset = PO
     SelectObject(hdc, oldBrush);
     SelectObject(hdc, oldPen);
     DeleteObject(pen);
+    return true;
 }
 
 int PngResourceForButton(const ToolbarButton& button) {
@@ -792,7 +905,7 @@ std::vector<ToolbarButton> BuildToolbar(const OverlayState& state) {
     constexpr int iconW = 38;
     constexpr int buttonH = 32;
     constexpr int gap = 4;
-    constexpr int totalW = iconW * 10 + gap * 9;
+    constexpr int totalW = iconW * 11 + gap * 10;
     int x = state.selectedRect.left;
     int y = state.selectedRect.bottom + 8;
     if (x + totalW > state.frame->width) {
@@ -821,6 +934,7 @@ std::vector<ToolbarButton> BuildToolbar(const OverlayState& state) {
     addTool(AnnotationTool::Rectangle, L"Rect", iconW);
     addTool(AnnotationTool::Ellipse, L"Oval", iconW);
     addTool(AnnotationTool::Text, L"Text", iconW);
+    addTool(AnnotationTool::Mosaic, L"Mosaic", iconW);
     addCommand(100, L"Undo", iconW);
     addCommand(101, L"Color", iconW);
     addCommand(102, L"Cancel", iconW);
@@ -839,6 +953,19 @@ void DrawToolbarIcon(HDC hdc, const ToolbarButton& button, const OverlayState& s
     const RECT r = button.rect;
     const int cx = (r.left + r.right) / 2;
     const int cy = (r.top + r.bottom) / 2;
+    if (button.tool == AnnotationTool::Mosaic) {
+        const auto brush = static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
+        for (int row = 0; row < 3; ++row) {
+            for (int column = 0; column < 3; ++column) {
+                const int left = cx - 8 + column * 6;
+                const int top = cy - 8 + row * 6;
+                const int size = (row + column) % 2 == 0 ? 5 : 3;
+                const RECT tile{left, top, left + size, top + size};
+                FillRect(hdc, &tile, brush);
+            }
+        }
+        return;
+    }
     const COLORREF iconColor = RGB(245, 245, 245);
 
     HPEN iconPen = CreatePen(PS_SOLID, 2, iconColor);
@@ -951,36 +1078,42 @@ void PaintOverlay(HWND hwnd, OverlayState& state) {
 
     const int width = state.frame->width;
     const int height = state.frame->height;
-
-    HDC drawDc = hdc;
-    HDC backDc = CreateCompatibleDC(hdc);
-    HBITMAP backBmp = nullptr;
-    HGDIOBJ oldBackObj = nullptr;
-    if (backDc) {
-        backBmp = CreateCompatibleBitmap(hdc, width, height);
-        if (backBmp) {
-            oldBackObj = SelectObject(backDc, backBmp);
-            drawDc = backDc;
-        }
-    }
-
-    DrawFrameFull(drawDc, state.frame->darkPixels, width, height);
-
     RECT activeRect = state.selectedRect;
     if (state.action == OverlayAction::Selecting) {
         activeRect = NormalizeRect(state.dragStart, state.dragCurrent);
-        activeRect = ClampToBounds(activeRect, width, height);
+    }
+    activeRect = ClampToBounds(activeRect, width, height);
+    const bool hasSelection = HasArea(activeRect);
+
+    HDC drawDc = hdc;
+    HDC backDc = hasSelection ? CreateCompatibleDC(hdc) : nullptr;
+    HBITMAP backBmp = nullptr;
+    HGDIOBJ oldBackObj = nullptr;
+    void* backPixels = nullptr;
+    if (backDc) {
+        const BITMAPINFO bmi = TopDownBitmapInfo(width, height);
+        backBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &backPixels, nullptr, 0);
+        if (backBmp) {
+            oldBackObj = SelectObject(backDc, backBmp);
+            if (oldBackObj) {
+                drawDc = backDc;
+            }
+        }
     }
 
-    if (HasArea(activeRect)) {
-        DrawFrameClipRect(drawDc, state.frame->pixels, width, height, activeRect);
+    DrawFrameFull(drawDc, state.frame->darkened.pixels, width, height);
+
+    if (hasSelection) {
+        DrawFrameClipRect(drawDc, state.frame->image.pixels, width, height, activeRect);
         const int saved = SaveDC(drawDc);
         IntersectClipRect(drawDc, activeRect.left, activeRect.top, activeRect.right, activeRect.bottom);
+        const AnnotationSurface surface{drawDc, oldBackObj ? static_cast<std::uint8_t*>(backPixels) : nullptr,
+            RECT{0, 0, width, height}, activeRect};
         for (const auto& command : state.annotations) {
-            DrawAnnotation(drawDc, command);
+            DrawAnnotation(surface, command);
         }
         if (state.action == OverlayAction::DrawingAnnotation) {
-            DrawAnnotation(drawDc, state.currentAnnotation);
+            DrawAnnotation(surface, state.currentAnnotation);
         }
         if (state.textActive) {
             AnnotationCommand preview;
@@ -989,7 +1122,7 @@ void PaintOverlay(HWND hwnd, OverlayState& state) {
             preview.strokeWidth = state.strokeWidth;
             preview.points.push_back(state.textPoint);
             preview.text = state.textBuffer.empty() ? L"|" : state.textBuffer + L"|";
-            DrawAnnotation(drawDc, preview);
+            DrawAnnotation(surface, preview);
         }
         RestoreDC(drawDc, saved);
         DrawSelectionFrame(drawDc, activeRect);
@@ -1051,11 +1184,29 @@ bool IsDrawingTool(AnnotationTool tool) {
         tool == AnnotationTool::Rectangle ||
         tool == AnnotationTool::Ellipse ||
         tool == AnnotationTool::Arrow ||
-        tool == AnnotationTool::Text;
+        tool == AnnotationTool::Text ||
+        tool == AnnotationTool::Mosaic;
+}
+
+void CommitCurrentAnnotation(OverlayState& state) {
+    auto& command = state.currentAnnotation;
+    if (command.points.empty()) {
+        return;
+    }
+    if (command.tool == AnnotationTool::Mosaic) {
+        const RECT rect = NormalizeRect(command.points.front(), command.points.back());
+        if (IsRectEmpty(&rect)) {
+            return;
+        }
+    }
+    state.annotations.push_back(std::move(command));
 }
 
 void AcceptOverlay(HWND hwnd, OverlayState& state) {
     CommitTextIfNeeded(state);
+    if (state.action == OverlayAction::DrawingAnnotation && state.currentAnnotation.tool == AnnotationTool::Mosaic) {
+        CommitCurrentAnnotation(state);
+    }
     state.action = OverlayAction::None;
     state.resizeHandle = ResizeHandle::None;
     state.accepted = true;
@@ -1264,9 +1415,13 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     state->selectedRect = r;
                 }
             } else if (state->action == OverlayAction::DrawingAnnotation) {
-                if (!state->currentAnnotation.points.empty()) {
-                    state->annotations.push_back(state->currentAnnotation);
+                if (state->currentAnnotation.tool == AnnotationTool::Mosaic) {
+                    state->currentAnnotation.points.back() = POINT{
+                        std::clamp<LONG>(GET_X_LPARAM(lParam), state->selectedRect.left, state->selectedRect.right),
+                        std::clamp<LONG>(GET_Y_LPARAM(lParam), state->selectedRect.top, state->selectedRect.bottom)
+                    };
                 }
+                CommitCurrentAnnotation(*state);
             }
             state->action = OverlayAction::None;
             state->resizeHandle = ResizeHandle::None;
@@ -1402,9 +1557,7 @@ std::optional<OverlayState> ShowOverlayAndEdit(CapturedFrame& frame) {
     return std::nullopt;
 }
 
-CroppedImage CropFrame(const CapturedFrame& frame, RECT rect) {
-    rect = ClampToBounds(rect, frame.width, frame.height);
-
+CroppedImage CropFrame(const CapturedFrame& frame, const RECT& rect) {
     CroppedImage out;
     out.width = rect.right - rect.left;
     out.height = rect.bottom - rect.top;
@@ -1416,7 +1569,7 @@ CroppedImage CropFrame(const CapturedFrame& frame, RECT rect) {
     out.pixels.resize(static_cast<size_t>(out.width) * static_cast<size_t>(out.height) * 4);
 
     for (int y = 0; y < out.height; ++y) {
-        const auto* src = frame.pixels.data() +
+        const auto* src = frame.image.pixels.data() +
             (static_cast<size_t>(rect.top + y) * static_cast<size_t>(frame.width) + static_cast<size_t>(rect.left)) * 4;
         auto* dst = out.pixels.data() + static_cast<size_t>(y) * static_cast<size_t>(out.width) * 4;
         std::memcpy(dst, src, static_cast<size_t>(out.width) * 4);
@@ -1425,22 +1578,18 @@ CroppedImage CropFrame(const CapturedFrame& frame, RECT rect) {
     return out;
 }
 
-void BakeAnnotations(CroppedImage& image, const std::vector<AnnotationCommand>& annotations, POINT cropOrigin) {
-    if (image.width <= 0 || image.height <= 0 || image.pixels.empty() || annotations.empty()) {
-        return;
+bool BakeAnnotations(CroppedImage& image, const std::vector<AnnotationCommand>& annotations, const RECT& cropRect) {
+    if (annotations.empty()) {
+        return true;
     }
-
-    BITMAPINFO bmi{};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = image.width;
-    bmi.bmiHeader.biHeight = -image.height;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
+    if (image.width <= 0 || image.height <= 0 || image.pixels.empty()) {
+        return false;
+    }
+    const BITMAPINFO bmi = TopDownBitmapInfo(image.width, image.height);
 
     HDC screenDc = GetDC(nullptr);
     if (!screenDc) {
-        return;
+        return false;
     }
 
     void* bits = nullptr;
@@ -1450,7 +1599,7 @@ void BakeAnnotations(CroppedImage& image, const std::vector<AnnotationCommand>& 
             DeleteObject(dib);
         }
         ReleaseDC(nullptr, screenDc);
-        return;
+        return false;
     }
 
     std::memcpy(bits, image.pixels.data(), image.pixels.size());
@@ -1458,20 +1607,31 @@ void BakeAnnotations(CroppedImage& image, const std::vector<AnnotationCommand>& 
     if (!memDc) {
         DeleteObject(dib);
         ReleaseDC(nullptr, screenDc);
-        return;
+        return false;
     }
 
     HGDIOBJ old = SelectObject(memDc, dib);
-    for (const auto& command : annotations) {
-        DrawAnnotation(memDc, command, cropOrigin);
+    bool baked = old != nullptr;
+    if (baked) {
+        const AnnotationSurface surface{memDc, static_cast<std::uint8_t*>(bits), cropRect, cropRect};
+        for (const auto& command : annotations) {
+            if (!DrawAnnotation(surface, command)) {
+                baked = false;
+                break;
+            }
+        }
+        if (GdiFlush() && baked) {
+            std::memcpy(image.pixels.data(), bits, image.pixels.size());
+        } else {
+            baked = false;
+        }
+        SelectObject(memDc, old);
     }
-    GdiFlush();
-    std::memcpy(image.pixels.data(), bits, image.pixels.size());
 
-    SelectObject(memDc, old);
     DeleteDC(memDc);
     DeleteObject(dib);
     ReleaseDC(nullptr, screenDc);
+    return baked;
 }
 
 HGLOBAL CreateClipboardDib(const CroppedImage& image) {
@@ -1607,13 +1767,13 @@ std::optional<std::wstring> CacheClipboardPng(HGLOBAL pngMemory) {
     }
     localAppData.resize(copiedChars);
 
-    const std::wstring cacheDirectory = localAppData + L"\\PrintScreenRegionSnip";
-    if (!CreateDirectoryW(cacheDirectory.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+    const std::wstring directory = localAppData + L"\\PrintScreenRegionSnip";
+    if (!CreateDirectoryW(directory.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
         return std::nullopt;
     }
 
-    const std::wstring finalPath = cacheDirectory + L"\\clipboard-image.png";
-    const std::wstring temporaryPath = cacheDirectory + L"\\clipboard-image.tmp";
+    const std::wstring finalPath = directory + L"\\clipboard-image.png";
+    const std::wstring temporaryPath = directory + L"\\clipboard-image.tmp";
     const SIZE_T pngSize = GlobalSize(pngMemory);
     const void* pngBytes = GlobalLock(pngMemory);
     if (!pngBytes || pngSize == 0 || pngSize > MAXDWORD) {
@@ -1743,12 +1903,13 @@ bool CopyToClipboard(const CroppedImage& image) {
 }
 
 void RequestCapture() {
-    if (g_captureInProgress || g_captureQueued) {
+    if (g_capturePending.exchange(true, std::memory_order_relaxed)) {
         return;
     }
 
-    g_captureQueued = true;
-    PostThreadMessageW(g_mainThreadId, WM_APP_TRIGGER_CAPTURE, 0, 0);
+    if (!PostThreadMessageW(g_mainThreadId, WM_APP_TRIGGER_CAPTURE, 0, 0)) {
+        g_capturePending.store(false, std::memory_order_relaxed);
+    }
 }
 
 void HandleCaptureRequest() {
@@ -1756,9 +1917,7 @@ void HandleCaptureRequest() {
     GetCursorPos(&cursorPos);
 
     CapturedFrame frame;
-    const bool captured = CaptureDesktopFrame(cursorPos, frame);
-
-    if (!captured) {
+    if (!CaptureDesktopFrame(cursorPos, frame)) {
         MessageBeep(MB_ICONHAND);
         return;
     }
@@ -1768,14 +1927,10 @@ void HandleCaptureRequest() {
         return;
     }
 
-    CroppedImage crop = CropFrame(frame, editResult->selectedRect);
-    POINT cropOrigin{editResult->selectedRect.left, editResult->selectedRect.top};
-    BakeAnnotations(crop, editResult->annotations, cropOrigin);
-    if (CopyToClipboard(crop)) {
-        MessageBeep(MB_OK);
-    } else {
-        MessageBeep(MB_ICONHAND);
-    }
+    const RECT cropRect = ClampToBounds(editResult->selectedRect, frame.width, frame.height);
+    CroppedImage crop = CropFrame(frame, cropRect);
+    const bool copied = BakeAnnotations(crop, editResult->annotations, cropRect) && CopyToClipboard(crop);
+    MessageBeep(copied ? MB_OK : MB_ICONHAND);
 }
 
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -1789,7 +1944,37 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         }
     }
 
-    return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+struct InputStartup {
+    HANDLE ready;
+    bool hookInstalled = false;
+};
+
+DWORD WINAPI InputThreadProc(void* parameter) {
+    auto& startup = *static_cast<InputStartup*>(parameter);
+    MSG msg{};
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+    HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, nullptr, 0);
+    const bool hotkeyRegistered = hook && RegisterHotKey(nullptr, HOTKEY_PRINTSCREEN, MOD_NOREPEAT, VK_SNAPSHOT);
+    startup.hookInstalled = hook != nullptr;
+    SetEvent(startup.ready);
+    if (!hook) {
+        return 1;
+    }
+
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_PRINTSCREEN) {
+            RequestCapture();
+        }
+    }
+
+    if (hotkeyRegistered) {
+        UnregisterHotKey(nullptr, HOTKEY_PRINTSCREEN);
+    }
+    UnhookWindowsHookEx(hook);
+    return 0;
 }
 
 }  // namespace
@@ -1808,29 +1993,31 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     MSG queueInit{};
     PeekMessageW(&queueInit, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 
-    g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, nullptr, 0);
-    if (!g_keyboardHook) {
-        MessageBoxW(nullptr, L"Failed to install keyboard hook.", L"PrintScreenRegionSnip", MB_ICONERROR);
+    HANDLE inputReady = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    InputStartup startup{inputReady};
+    DWORD inputThreadId = 0;
+    HANDLE inputThread = inputReady ? CreateThread(nullptr, 0, InputThreadProc, &startup, 0, &inputThreadId) : nullptr;
+    if (inputThread) {
+        WaitForSingleObject(inputReady, INFINITE);
+    }
+    if (inputReady) {
+        CloseHandle(inputReady);
+    }
+    if (!startup.hookInstalled) {
+        if (inputThread) {
+            WaitForSingleObject(inputThread, INFINITE);
+            CloseHandle(inputThread);
+        }
+        MessageBoxW(nullptr, L"Failed to start keyboard input.", L"PrintScreenRegionSnip", MB_ICONERROR);
         Gdiplus::GdiplusShutdown(gdiplusToken);
         return 1;
     }
 
-    RegisterHotKey(nullptr, HOTKEY_PRINTSCREEN, MOD_NOREPEAT, VK_SNAPSHOT);
-
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_PRINTSCREEN) {
-            RequestCapture();
-            continue;
-        }
-
         if (msg.message == WM_APP_TRIGGER_CAPTURE) {
-            if (!g_captureInProgress) {
-                g_captureQueued = false;
-                g_captureInProgress = true;
-                HandleCaptureRequest();
-                g_captureInProgress = false;
-            }
+            HandleCaptureRequest();
+            g_capturePending.store(false, std::memory_order_relaxed);
             continue;
         }
 
@@ -1838,9 +2025,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&msg);
     }
 
-    UnregisterHotKey(nullptr, HOTKEY_PRINTSCREEN);
-    UnhookWindowsHookEx(g_keyboardHook);
-    g_keyboardHook = nullptr;
+    PostThreadMessageW(inputThreadId, WM_QUIT, 0, 0);
+    WaitForSingleObject(inputThread, INFINITE);
+    CloseHandle(inputThread);
     Gdiplus::GdiplusShutdown(gdiplusToken);
 
     return 0;

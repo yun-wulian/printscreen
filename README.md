@@ -10,7 +10,8 @@ A lightweight Windows 10/11 screenshot helper that keeps your `PrintScreen` habi
 - Shows a full-screen frozen overlay with darkened background
 - Lets you drag with left mouse to select a rectangle
 - Keeps the frozen overlay open after selection so the region can be moved or resized
-- Provides an on-overlay toolbar for move, arrow, pen, rectangle, ellipse, text, undo, color, cancel, and OK
+- Provides an on-overlay toolbar for move, arrow, pen, rectangle, ellipse, text, mosaic, undo, color, cancel, and OK
+- Click the mosaic grid icon after selecting a screenshot region, then drag inside the selection to pixelate a rectangle. Use Undo or `Ctrl+Z` to remove the last edit.
 - Copies the final annotated crop as `CF_DIB`, `PNG`, and a `CF_HDROP` reference to a cached PNG file after OK, Enter, double-clicking outside the selected region, or double-clicking anywhere while using a non-drawing tool
 - `Esc`, right-click, or Cancel closes the frozen overlay without copying
 
@@ -52,7 +53,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\uninstall.ps1
 ## Behavior notes
 
 - Current version freezes the full virtual desktop, so regions can span multiple displays.
-- The app uses full-desktop GDI capture first, then repairs the active fullscreen output with DXGI when available.
+- The app captures the virtual desktop with GDI. It also tries DXGI for a foreground window that covers a monitor, or for the monitor under the cursor if GDI fails and there is no fullscreen window.
 - Most borderless/fullscreen apps work; exclusive fullscreen capture depends on OS/driver duplication support.
 - Some protected or anti-cheat-restricted content can still fail to capture due to OS/driver security boundaries.
 
